@@ -14,12 +14,12 @@ BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 def test_backend_connection() -> bool:
     """Test if backend is accessible."""
     try:
-        response = requests.get(f"{BACKEND_URL}/health", timeout=5)
+        response = requests.get(f"{BACKEND_URL}/health", timeout=10)
         return response.status_code == 200
     except:
         try:
             # Try root endpoint if health doesn't work
-            response = requests.get(f"{BACKEND_URL}/", timeout=5)
+            response = requests.get(f"{BACKEND_URL}/", timeout=10)
             return response.status_code == 200
         except:
             return False
@@ -172,82 +172,157 @@ if st.session_state['job_finder_mode']:
                         data = {
                             "role": desired_role if desired_role else None,
                             "location": location if location else None,
-                            "experience_level": experience_level if experience_level else None
+                            "experience_level": experience_level if experience_level else None,
+                            "stream": "true",
                         }
                         
                         # Remove None values
                         data = {k: v for k, v in data.items() if v is not None}
                         
-                        # Make API request with longer timeout for processing
+                        # Make SSE streaming request
                         response = requests.post(
                             f"{BACKEND_URL}/find_jobs",
                             files=files,
                             data=data,
-                            timeout=180  # 3 minutes timeout (reduced from 5, should be enough)
+                            timeout=300,
+                            stream=True,
                         )
                         
                         if response.status_code == 200:
-                            result = response.json()
-                            jobs = result.get("jobs", [])
+                            content_type = response.headers.get("content-type", "")
                             
-                            if jobs:
-                                st.success(f"Found {len(jobs)} matching jobs!")
-                                st.divider()
+                            # --- SSE Streaming Path ---
+                            if "text/event-stream" in content_type:
+                                jobs = []
+                                status_placeholder = st.empty()
+                                job_containers = st.container()
                                 
-                                # Display jobs in cards
-                                for idx, job in enumerate(jobs, 1):
-                                    with st.container():
-                                        col1, col2 = st.columns([3, 1])
+                                for line in response.iter_lines(decode_unicode=True):
+                                    if not line:
+                                        continue
+                                    if not line.startswith("data: "):
+                                        continue
+                                    payload = line[len("data: "):]
+                                    try:
+                                        import json as _json
+                                        event = _json.loads(payload)
+                                    except Exception:
+                                        continue
+                                    
+                                    if event.get("type") == "done":
+                                        status_placeholder.success(f"✅ Found {event.get('total', len(jobs))} matching jobs!")
+                                        break
+                                    
+                                    if event.get("type") == "job":
+                                        jobs.append(event)
+                                        status_placeholder.info(f"⏳ Found {len(jobs)} jobs so far...")
                                         
-                                        with col1:
-                                            st.markdown(f"### {idx}. {job['title']}")
-                                            
-                                            # Company info with details
-                                            company_info = job.get('company_info', {})
-                                            company_display = job['company']
-                                            if company_info.get('size'):
-                                                company_display += f" ({company_info['size']})"
-                                            if company_info.get('industry'):
-                                                company_display += f" - {company_info['industry']}"
-                                            
-                                            st.markdown(f"**Company:** {company_display}")
-                                            st.markdown(f"**Location:** {job['location']}")
-                                            
-                                            # Salary information
-                                            if job.get('salary'):
-                                                st.markdown(f"💰 **Salary:** {job['salary']}")
-                                            
-                                            # Match reason with better formatting
-                                            st.markdown(f"**Why this matches:** {job['match_reason']}")
-                                            
-                                            # Requirements
-                                            if job.get('requirements'):
-                                                with st.expander("📋 What They Need From You"):
-                                                    for req in job['requirements']:
-                                                        st.markdown(f"• {req}")
-                                            
-                                            # Benefits
-                                            if job.get('benefits'):
-                                                with st.expander("🎁 Benefits & Perks"):
-                                                    for benefit in job['benefits']:
-                                                        st.markdown(f"✓ {benefit}")
-                                            
-                                            # Description
-                                            st.markdown("**Job Details:**")
-                                            st.markdown(job['description'])
-                                            
-                                            # Company website if available
-                                            if company_info.get('website'):
-                                                st.markdown(f"🌐 [Company Website]({company_info['website']})")
-                                        
-                                        with col2:
-                                            st.markdown(f"**Match Score:** {job['similarity_score']:.1%}")
-                                            if job['link']:
-                                                st.link_button("🔗 View Job", job['link'], use_container_width=True)
-                                        
-                                        st.divider()
+                                        # Display the new job immediately
+                                        idx = len(jobs)
+                                        job = event
+                                        with job_containers:
+                                            with st.container():
+                                                col1, col2 = st.columns([3, 1])
+                                                
+                                                with col1:
+                                                    st.markdown(f"### {idx}. {job['title']}")
+                                                    
+                                                    company_info = job.get('company_info', {})
+                                                    company_display = job['company']
+                                                    if company_info.get('size'):
+                                                        company_display += f" ({company_info['size']})"
+                                                    if company_info.get('industry'):
+                                                        company_display += f" - {company_info['industry']}"
+                                                    
+                                                    st.markdown(f"**Company:** {company_display}")
+                                                    st.markdown(f"**Location:** {job['location']}")
+                                                    
+                                                    if job.get('salary'):
+                                                        st.markdown(f"💰 **Salary:** {job['salary']}")
+                                                    
+                                                    st.markdown(f"**Why this matches:** {job.get('match_reason', 'Good match')}")
+                                                    
+                                                    if job.get('requirements'):
+                                                        with st.expander("📋 What They Need From You"):
+                                                            for req in job['requirements']:
+                                                                st.markdown(f"• {req}")
+                                                    
+                                                    if job.get('benefits'):
+                                                        with st.expander("🎁 Benefits & Perks"):
+                                                            for benefit in job['benefits']:
+                                                                st.markdown(f"✓ {benefit}")
+                                                    
+                                                    st.markdown("**Job Details:**")
+                                                    st.markdown(job['description'])
+                                                    
+                                                    if company_info.get('website'):
+                                                        st.markdown(f"🌐 [Company Website]({company_info['website']})")
+                                                
+                                                with col2:
+                                                    st.markdown(f"**Match Score:** {job.get('similarity_score', 0):.1%}")
+                                                    if job.get('link'):
+                                                        st.link_button("🔗 View Job", job['link'], use_container_width=True)
+                                                
+                                                st.divider()
+                                
+                                if not jobs:
+                                    st.warning("No jobs found. Try adjusting your search criteria or uploading a different resume.")
+                            
+                            # --- Batch JSON Fallback ---
                             else:
-                                st.warning("No jobs found. Try adjusting your search criteria or uploading a different resume.")
+                                result = response.json()
+                                jobs = result.get("jobs", [])
+                                
+                                if jobs:
+                                    st.success(f"Found {len(jobs)} matching jobs!")
+                                    st.divider()
+                                    
+                                    for idx, job in enumerate(jobs, 1):
+                                        with st.container():
+                                            col1, col2 = st.columns([3, 1])
+                                            
+                                            with col1:
+                                                st.markdown(f"### {idx}. {job['title']}")
+                                                
+                                                company_info = job.get('company_info', {})
+                                                company_display = job['company']
+                                                if company_info.get('size'):
+                                                    company_display += f" ({company_info['size']})"
+                                                if company_info.get('industry'):
+                                                    company_display += f" - {company_info['industry']}"
+                                                
+                                                st.markdown(f"**Company:** {company_display}")
+                                                st.markdown(f"**Location:** {job['location']}")
+                                                
+                                                if job.get('salary'):
+                                                    st.markdown(f"💰 **Salary:** {job['salary']}")
+                                                
+                                                st.markdown(f"**Why this matches:** {job['match_reason']}")
+                                                
+                                                if job.get('requirements'):
+                                                    with st.expander("📋 What They Need From You"):
+                                                        for req in job['requirements']:
+                                                            st.markdown(f"• {req}")
+                                                
+                                                if job.get('benefits'):
+                                                    with st.expander("🎁 Benefits & Perks"):
+                                                        for benefit in job['benefits']:
+                                                            st.markdown(f"✓ {benefit}")
+                                                
+                                                st.markdown("**Job Details:**")
+                                                st.markdown(job['description'])
+                                                
+                                                if company_info.get('website'):
+                                                    st.markdown(f"🌐 [Company Website]({company_info['website']})")
+                                            
+                                            with col2:
+                                                st.markdown(f"**Match Score:** {job['similarity_score']:.1%}")
+                                                if job['link']:
+                                                    st.link_button("🔗 View Job", job['link'], use_container_width=True)
+                                            
+                                            st.divider()
+                                else:
+                                    st.warning("No jobs found. Try adjusting your search criteria or uploading a different resume.")
                         else:
                             st.error(f"Backend returned error (status {response.status_code}): {response.text}")
                             

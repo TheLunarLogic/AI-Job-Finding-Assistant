@@ -6,11 +6,14 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.message import add_messages
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 import os
+import json
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 load_dotenv()
 
@@ -99,233 +102,224 @@ async def find_jobs(
     resume: UploadFile = File(...),
     role: Optional[str] = Form(None),
     location: Optional[str] = Form(None),
-    experience_level: Optional[str] = Form(None)
+    experience_level: Optional[str] = Form(None),
+    stream: Optional[str] = Form("false"),
 ):
     """
     Find jobs based on resume and optional filters.
-    
+
     Args:
         resume: Resume file (PDF, DOCX, or TXT)
         role: Desired job role
         location: Job location
         experience_level: Experience level
-        
+        stream: "true" to enable SSE streaming, "false" (default) for batch JSON
+
     Returns:
-        JSON response with ranked job results
+        StreamingResponse (SSE) or JSONResponse depending on stream flag
     """
     try:
         # Import here to avoid circular imports
         import logging
         logging.basicConfig(level=logging.INFO)
         logger = logging.getLogger(__name__)
-        
+
         from resume_pipeline import extract_resume_text
         from utils.embeddings import embed_text, embed_texts
         from utils.text_processing import clean_html, extract_key_info
         from utils.company_info import get_company_info, generate_company_summary
         from utils.job_analyzer import analyze_job
-        from utils.role_parser import parse_roles, matches_role
         from sklearn.metrics.pairwise import cosine_similarity
-        from job_fetchers.google_cse import search_jobs as google_cse_search
+        from job_fetchers.jsearch_rapidapi import fetch_jsearch_jobs_rapidapi
         from job_fetchers.rss_fetcher import fetch_all_rss_jobs
         from job_fetchers.adzuna import fetch_adzuna_jobs
-        from job_fetchers.job_board_aggregator import fetch_all_free_jobs
-        
-        # Read resume file
+
+        # Read and extract resume text
         resume_content = await resume.read()
-        
-        # Extract text from resume
         resume_text = extract_resume_text(resume_content, resume.filename)
         logger.info(f"Extracted resume text: {len(resume_text)} characters")
-        
+
         # Generate resume embedding
         resume_embedding = embed_text(resume_text)
         logger.info("Generated resume embedding")
-        
-        # Fetch jobs from multiple sources
-        all_jobs = []
-        google_jobs = []
-        rss_jobs = []
-        
-        # Search query based on resume text and filters
-        search_query = resume_text[:500]  # Use first 500 chars as search query
-        if role:
-            search_query = f"{role} {search_query}"
-        
-        logger.info(f"Search query: {search_query[:100]}...")
+
         logger.info(f"Filters - Role: {role}, Location: {location}, Experience: {experience_level}")
-        
-        # Fetch from Google CSE
-        logger.info("Fetching jobs from Google CSE...")
-        google_jobs = google_cse_search(
-            query=search_query,
-            role=role,
-            location=location,
-            max_results=15
-        )
-        logger.info(f"Google CSE returned {len(google_jobs)} jobs")
-        all_jobs.extend(google_jobs)
-        
-        # Fetch from RSS feeds WITH role filter (strict matching)
-        logger.info("Fetching jobs from RSS feeds...")
-        rss_jobs = fetch_all_rss_jobs(
-            role=role,  # STRICT: Only fetch jobs matching the user's role
-            location=location,
-            max_results=30
-        )
-        logger.info(f"RSS feeds returned {len(rss_jobs)} jobs")
-        all_jobs.extend(rss_jobs)
-        
-        # Fetch from Adzuna API
-        logger.info("Fetching jobs from Adzuna...")
-        adzuna_jobs = fetch_adzuna_jobs(
-            role=role,
-            location=location,
-            max_results=15
-        )
-        logger.info(f"Adzuna returned {len(adzuna_jobs)} jobs")
-        all_jobs.extend(adzuna_jobs)
-        
-        # Fetch from free job board aggregators
-        logger.info("Fetching jobs from free job boards...")
-        free_jobs = fetch_all_free_jobs(
-            role=role,
-            location=location,
-            max_results=20
-        )
-        logger.info(f"Free job boards returned {len(free_jobs)} jobs")
-        all_jobs.extend(free_jobs)
-        
-        logger.info(f"Total jobs fetched: {len(all_jobs)}")
-        
-        # If no jobs found, add fallback jobs based on role
-        if len(all_jobs) == 0:
-            logger.warning("No jobs found from any source, adding fallback jobs")
-            fallback_jobs = _get_fallback_jobs(role, location)
-            all_jobs.extend(fallback_jobs)
-            logger.info(f"Added {len(fallback_jobs)} fallback jobs")
-        
-        # Remove duplicates based on link
-        seen_links = set()
+
+        # --- Concurrent Fetching from all sources ---
+        def _fetch_jsearch():
+            return fetch_jsearch_jobs_rapidapi(role=role, location=location, max_results=30, num_pages=2)
+
+        def _fetch_rss():
+            return fetch_all_rss_jobs(role=role, location=location, max_results=30)
+
+        def _fetch_adzuna():
+            return fetch_adzuna_jobs(role=role, location=location, max_results=20)
+
+        source_counts = {"jsearch": 0, "rss": 0, "adzuna": 0}
+        all_jobs = []
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                executor.submit(_fetch_jsearch): "jsearch",
+                executor.submit(_fetch_rss): "rss",
+                executor.submit(_fetch_adzuna): "adzuna",
+            }
+            for future in as_completed(futures):
+                source_name = futures[future]
+                try:
+                    result = future.result()
+                    source_counts[source_name] = len(result)
+                    logger.info(f"{source_name} returned {len(result)} jobs")
+                    all_jobs.extend(result)
+                except Exception as e:
+                    logger.error(f"{source_name} failed — continuing: {e}")
+
+        logger.info(f"Total raw jobs fetched: {len(all_jobs)}")
+
+        # --- Deduplication by normalised(title + company) ---
+        seen_keys: set = set()
+        seen_links: set = set()
         unique_jobs = []
         for job in all_jobs:
-            if job["link"] not in seen_links and job.get("link"):
-                seen_links.add(job["link"])
-                unique_jobs.append(job)
-        
-        # STRICT ROLE FILTERING: Filter jobs to only include those matching the user's entered role
-        if role:
-            logger.info(f"Filtering jobs to match role(s): {role}")
-            parsed_roles = parse_roles(role)
-            logger.info(f"Parsed roles: {parsed_roles}")
-            
-            filtered_jobs = []
-            for job in unique_jobs:
-                if matches_role(job.get("title", ""), job.get("description", ""), role):
-                    filtered_jobs.append(job)
-            
-            logger.info(f"Filtered from {len(unique_jobs)} to {len(filtered_jobs)} jobs matching role(s)")
-            unique_jobs = filtered_jobs
-            
-            # If filtering removed all jobs, don't fallback - return empty
-            # This ensures we only show relevant jobs
-            if len(unique_jobs) == 0:
-                logger.warning(f"No jobs matched role '{role}' exactly. Returning empty results.")
-                return JSONResponse({
-                    "jobs": [],
-                    "message": f"No jobs found matching '{role}'. Try adjusting your role keywords or search criteria.",
-                    "debug_info": {
-                        "google_cse_jobs": len(google_jobs),
-                        "rss_jobs": len(rss_jobs),
-                        "total_fetched": len(all_jobs),
-                        "role_filter": role,
-                        "location_filter": location
-                    }
-                })
-        
-        # Limit jobs to process to avoid timeout (max 50 jobs)
-        jobs_to_process = unique_jobs[:50]
-        logger.info(f"Processing {len(jobs_to_process)} jobs for similarity matching")
-        
-        # Generate embeddings for job descriptions
-        job_texts = [
-            f"{job['title']} {job['description']} {job.get('company', '')}"
-            for job in jobs_to_process
-        ]
-        
-        if not job_texts:
-            logger.warning("No jobs found after fetching from all sources")
+            norm_title = job.get("title", "").lower().strip()
+            norm_company = job.get("company", "").lower().strip()
+            dedup_key = (norm_title, norm_company)
+            link = job.get("link", "")
+            if dedup_key in seen_keys:
+                continue
+            if link and link in seen_links:
+                continue
+            if link:
+                seen_links.add(link)
+            seen_keys.add(dedup_key)
+            unique_jobs.append(job)
+
+        logger.info(f"After deduplication: {len(unique_jobs)} jobs")
+
+        # Batch cap to avoid timeout / memory issues
+        jobs_to_process = unique_jobs[:100]
+
+        enable_stream = stream and stream.lower() == "true"
+
+        if not jobs_to_process:
+            if enable_stream:
+                async def _empty_stream():
+                    event = json.dumps({"type": "done", "total": 0, "message": "No jobs found. Try adjusting your search criteria."})
+                    yield f"data: {event}\n\n"
+                return StreamingResponse(_empty_stream(), media_type="text/event-stream")
             return JSONResponse({
                 "jobs": [],
                 "message": "No jobs found. Try adjusting your search criteria.",
                 "debug_info": {
-                    "google_cse_jobs": len(google_jobs),
-                    "rss_jobs": len(rss_jobs),
-                    "total_fetched": len(all_jobs),
+                    "jsearch_jobs": source_counts["jsearch"],
+                    "rss_jobs": source_counts["rss"],
+                    "adzuna_jobs": source_counts["adzuna"],
+                    "total_raw_fetched": len(all_jobs),
+                    "after_dedup": len(unique_jobs),
                     "role_filter": role,
-                    "location_filter": location
+                    "location_filter": location,
                 }
             })
-        
-        logger.info("Generating job embeddings...")
+
+        # ============================================================
+        # STREAMING PATH — yield jobs one-by-one as SSE events
+        # ============================================================
+        if enable_stream:
+            async def _job_stream():
+                streamed = 0
+                for job in jobs_to_process:
+                    try:
+                        desc_text = f"{job['title']} {job['description']} {job.get('company', '')}"
+                        job_emb = embed_text(desc_text)
+                        similarity = float(cosine_similarity([resume_embedding], [job_emb])[0][0])
+
+                        clean_description = clean_html(job.get("description", ""))
+                        clean_description = extract_key_info(clean_description, max_length=400)
+
+                        job_analysis = analyze_job(job.get("description", ""), job.get("company", ""))
+                        company_name = job.get("company", "Not specified")
+                        company_info = get_company_info(company_name, job.get("description", ""))
+                        company_summary = generate_company_summary(
+                            company_name, job.get("title", ""), clean_description
+                        )
+                        enhanced_description = f"{company_summary}\n\n{clean_description}"
+
+                        event_data = {
+                            "type": "job",
+                            "title": job["title"],
+                            "company": company_name,
+                            "location": job["location"],
+                            "description": enhanced_description,
+                            "link": job["link"],
+                            "source": job.get("source", "Unknown"),
+                            "similarity_score": round(similarity, 3),
+                            "match_reason": generate_match_reason(similarity, job, resume_text),
+                            "company_info": {
+                                "size": company_info.get("company_size") or job_analysis.get("employee_count"),
+                                "industry": company_info.get("industry"),
+                                "website": company_info.get("website"),
+                            },
+                            "salary": job_analysis.get("salary"),
+                            "requirements": job_analysis.get("requirements", [])[:6],
+                            "benefits": job_analysis.get("benefits", [])[:6],
+                        }
+                        yield f"data: {json.dumps(event_data)}\n\n"
+                        streamed += 1
+                    except Exception as e:
+                        logger.error(f"Error streaming job: {e}")
+                        continue
+
+                # Sentinel
+                yield f"data: {json.dumps({'type': 'done', 'total': streamed})}\n\n"
+                logger.info(f"Streamed {streamed} jobs")
+
+            return StreamingResponse(_job_stream(), media_type="text/event-stream")
+
+        # ============================================================
+        # BATCH PATH (default) — same as original behaviour
+        # ============================================================
+
+        # --- Embed job descriptions ---
+        logger.info(f"Generating embeddings for {len(jobs_to_process)} jobs...")
+        job_texts = [
+            f"{job['title']} {job['description']} {job.get('company', '')}"
+            for job in jobs_to_process
+        ]
         job_embeddings = embed_texts(job_texts)
         logger.info("Job embeddings generated")
-        
-        # Calculate similarity scores using sklearn
-        # cosine_similarity expects 2D arrays: [resume_vec] and job_vecs
-        logger.info("Calculating similarity scores...")
+
+        # --- Cosine similarity ---
         similarity_scores = cosine_similarity([resume_embedding], job_embeddings)[0]
-        
-        # MINIMUM SIMILARITY THRESHOLD - filter out low-quality matches
-        MIN_SIMILARITY_THRESHOLD = 0.25  # 25% minimum similarity
-        
-        scored_jobs = []
+
         for i, job in enumerate(jobs_to_process):
             similarity = float(similarity_scores[i])
             job["similarity_score"] = similarity
             job["match_reason"] = generate_match_reason(similarity, job, resume_text)
-            
-            # Only include jobs above threshold
-            if similarity >= MIN_SIMILARITY_THRESHOLD:
-                scored_jobs.append(job)
-        
-        logger.info(f"Filtered to {len(scored_jobs)} jobs above {MIN_SIMILARITY_THRESHOLD:.0%} similarity threshold")
-        
-        # Sort by similarity score (highest first)
+
+        # --- Sort descending, return top 20 (no hard threshold) ---
         ranked_jobs = sorted(
-            scored_jobs,
+            jobs_to_process,
             key=lambda x: x.get("similarity_score", 0),
-            reverse=True
+            reverse=True,
         )
-        
-        # Return top 20 jobs (or fewer if not enough meet threshold)
         top_jobs = ranked_jobs[:20]
-        logger.info(f"Selected top {len(top_jobs)} jobs")
-        
-        # Format response with cleaned descriptions and comprehensive job analysis
-        logger.info("Formatting job results...")
+        logger.info(f"Top similarity: {top_jobs[0]['similarity_score']:.4f} | selected {len(top_jobs)} jobs")
+
+        # --- Format results ---
         results = []
         for idx, job in enumerate(top_jobs):
             try:
-                # Clean HTML from description
                 clean_description = clean_html(job.get("description", ""))
                 clean_description = extract_key_info(clean_description, max_length=400)
-                
-                # Analyze job for salary, requirements, benefits, etc. (fast, limited analysis)
                 job_analysis = analyze_job(job.get("description", ""), job.get("company", ""))
-                
-                # Get company information (pass description for better analysis)
                 company_name = job.get("company", "Not specified")
                 company_info = get_company_info(company_name, job.get("description", ""))
                 company_summary = generate_company_summary(
                     company_name,
                     job.get("title", ""),
-                    clean_description
+                    clean_description,
                 )
-                
-                # Enhanced description with company info
                 enhanced_description = f"{company_summary}\n\n{clean_description}"
-                
                 results.append({
                     "title": job["title"],
                     "company": company_name,
@@ -337,15 +331,14 @@ async def find_jobs(
                     "company_info": {
                         "size": company_info.get("company_size") or job_analysis.get("employee_count"),
                         "industry": company_info.get("industry"),
-                        "website": company_info.get("website")
+                        "website": company_info.get("website"),
                     },
                     "salary": job_analysis.get("salary"),
-                    "requirements": job_analysis.get("requirements", [])[:6],  # Top 6 requirements
-                    "benefits": job_analysis.get("benefits", [])[:6],  # Top 6 benefits
+                    "requirements": job_analysis.get("requirements", [])[:6],
+                    "benefits": job_analysis.get("benefits", [])[:6],
                 })
             except Exception as e:
                 logger.error(f"Error formatting job {idx}: {e}")
-                # Add job with minimal info if analysis fails
                 results.append({
                     "title": job.get("title", "Unknown"),
                     "company": job.get("company", "Not specified"),
@@ -359,58 +352,28 @@ async def find_jobs(
                     "requirements": [],
                     "benefits": [],
                 })
-        
+
         logger.info(f"Returning {len(results)} ranked jobs")
         return JSONResponse({
             "jobs": results,
             "total_found": len(results),
             "debug_info": {
-                "google_cse_jobs": len(google_jobs),
-                "rss_jobs": len(rss_jobs),
-                "total_fetched": len(all_jobs),
-                "unique_jobs": len(unique_jobs),
-                "ranked_jobs": len(results)
+                "jsearch_jobs": source_counts["jsearch"],
+                "rss_jobs": source_counts["rss"],
+                "adzuna_jobs": source_counts["adzuna"],
+                "total_raw_fetched": len(all_jobs),
+                "after_dedup": len(unique_jobs),
+                "ranked_returned": len(results),
+                "role_filter": role,
+                "location_filter": location,
             }
         })
-        
+
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()
         logger.error(f"Error processing job search: {error_details}")
         raise HTTPException(status_code=500, detail=f"Error processing job search: {str(e)}")
-
-
-def _get_fallback_jobs(role: Optional[str] = None, location: Optional[str] = None) -> List[Dict[str, str]]:
-    """Generate fallback jobs when no jobs are found from external sources."""
-    fallback_jobs = []
-    
-    # Common job sites to search
-    job_sites = [
-        {"name": "LinkedIn", "url": "https://www.linkedin.com/jobs/search/"},
-        {"name": "Indeed", "url": "https://www.indeed.com/jobs"},
-        {"name": "Glassdoor", "url": "https://www.glassdoor.com/Job/jobs.htm"},
-        {"name": "Monster", "url": "https://www.monster.com/jobs/search/"},
-        {"name": "Remote.co", "url": "https://remote.co/remote-jobs/"},
-    ]
-    
-    role_str = role or "your field"
-    location_str = location or "your location"
-    
-    for site in job_sites:
-        search_url = f"{site['url']}?q={role_str.replace(' ', '+')}"
-        if location_str and location_str.lower() != "remote":
-            search_url += f"&l={location_str.replace(' ', '+')}"
-        
-        fallback_jobs.append({
-            "title": f"{role_str.title()} - Search on {site['name']}",
-            "company": site['name'],
-            "location": location_str or "Various",
-            "description": f"Search for {role_str} jobs on {site['name']}. Visit the link to see current openings matching your criteria.",
-            "link": search_url,
-            "source": "Fallback"
-        })
-    
-    return fallback_jobs
 
 
 def generate_match_reason(similarity: float, job: Dict, resume_text: str = "") -> str:
