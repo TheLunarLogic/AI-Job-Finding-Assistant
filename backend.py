@@ -139,6 +139,15 @@ async def find_jobs(
         resume_text = extract_resume_text(resume_content, resume.filename)
         logger.info(f"Extracted resume text: {len(resume_text)} characters")
 
+        # --- Resume Validation ---
+        from utils.resume_validator import is_resume
+        if not is_resume(resume_text):
+            logger.warning("Uploaded file does not appear to be a resume")
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid input: Please upload your resume only."
+            )
+
         # Generate resume embedding
         resume_embedding = embed_text(resume_text)
         logger.info("Generated resume embedding")
